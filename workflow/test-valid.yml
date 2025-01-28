@@ -1,0 +1,49 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: argo-workflows-install
+  namespace: kube-system
+spec:
+  generators:
+  - list:
+        elements:
+          - chart: argo-workflows
+            version: 0.45.4
+            repoURL: "https://argoproj.github.io/argo-helm"
+            releaseName: argoworkflows
+            targetNamespace: argo
+  - clusters:
+      selector:
+        matchLabels:
+          infra.p2p.org/cilium-install: 'true'
+  goTemplate: true
+  goTemplateOptions:
+  - missingkey=error
+  template:
+    metadata:
+      name: argo-workflows-install-{{.name}}
+      annotations:
+        argocd.argoproj.io/sync-wave: "-2"
+    spec:
+      project: iaas-common
+      source:
+        repoURL: '{{ repoURL }}'
+        targetRevision: '{{ version }}'
+        chart: '{{ chart }}'
+        helm:
+          values: |
+            workflow:
+              serviceAccount:
+                create: true
+            controller:
+              workflowNamespaces:
+                - kube-system
+      destination:
+        server: '{{.server}}'
+        namespace: kube-system
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+        - CreateNamespace=true

@@ -1,0 +1,46 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: cilium-install
+  namespace: argocd
+spec:
+  generators:
+  - list:
+      elements:
+      - name: in-cluster
+        server: https://kubernetes.default.svc
+  template:
+    metadata:
+      name: cilium-install
+    spec:
+      project: default
+      source:
+        repoURL: https://helm.cilium.io
+        targetRevision: 1.16.5
+        chart: cilium
+        helm:
+          values: |
+            ipam:
+              mode: "kubernetes"
+              operator:
+                clusterPoolIPv4PodCIDRList: 
+                  - "10.96.0.0/16"
+                clusterPoolIPv4MaskSize: 24
+            clustermesh:
+              useAPIServer: true
+            ipv4NativeRoutingCIDR: "10.244.0.0/16"
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: kube-system
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+        - CreateNamespace=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            maxDuration: 3m0s
+            factor: 2

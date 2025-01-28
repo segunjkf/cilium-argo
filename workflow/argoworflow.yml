@@ -1,0 +1,37 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: argo-workflows-helm-applicationset
+  namespace: argocd
+spec:
+  generators:
+    - list:
+        elements:
+          - chart: argo-workflows
+            version: 0.45.4
+            repoURL: "https://argoproj.github.io/argo-helm"
+            releaseName: argoworkflows
+            targetNamespace: argo
+  template:
+    metadata:
+      name: "argoworkflows"
+    spec:
+      project: default
+      source:
+        repoURL: '{{ repoURL }}'
+        chart: '{{ chart }}'
+        targetRevision: '{{ version }}'
+        helm:
+          values: |
+            server:
+              extraArgs:
+                - --auth-mode=server
+      destination:
+        server: "https://kubernetes.default.svc"
+        namespace: '{{ targetNamespace }}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+        - CreateNamespace=true
