@@ -1,0 +1,10 @@
+apiVersion: v2
+name: cilium
+version: 1.0.0
+maintainers:
+- name: Segun Saka-Aiyedun
+  email: sege.timz12@gmail.com
+dependencies:
+  - name: cilium
+    version: "1.16.6"
+    repository: "https://helm.cilium.io/"
