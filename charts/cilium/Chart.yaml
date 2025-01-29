@@ -7,4 +7,4 @@ maintainers:
 dependencies:
   - name: cilium
     version: "1.16.6"
-    repository: "https://helm.cilium.io/"
+    repository: "https://helm.cilium.io"

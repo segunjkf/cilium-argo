@@ -3,6 +3,5 @@ cluster:
   id: 1
 ipam:
   mode: "kubernetes"
-  ipv4NativeRoutingCIDR: "10.96.0.0/16"
 clustermesh:
   useAPIServer: true
