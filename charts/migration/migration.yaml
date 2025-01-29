@@ -1,0 +1,228 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cilium-migration-sa
+  namespace: argo-workflows
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cilium-migration-role
+rules:
+- apiGroups: [""]
+  resources: ["pods", "nodes", "namespaces"]
+  verbs: ["get", "list", "watch", "delete"]
+- apiGroups: ["apps"]
+  resources: ["daemonsets"]
+  verbs: ["get", "list", "watch", "delete"]
+- apiGroups: ["cilium.io"]
+  resources: ["ciliumendpoints"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["argoproj.io"]
+  resources: ["workflowtaskresults"]
+  verbs: ["create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cilium-migration-binding
+subjects:
+- kind: ServiceAccount
+  name: cilium-migration-sa
+  namespace: argo-workflows
+roleRef:
+  kind: ClusterRole
+  name: cilium-migration-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  name: cilium-flannel-migration
+  namespace: argo-workflows
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  serviceAccountName: cilium-migration-sa
+  entrypoint: main
+  templates:
+  - name: main
+    steps:
+    - - name: check-prerequisites
+        template: check-prerequisites
+    - - name: wait-for-cilium
+        template: wait-for-cilium
+    - - name: detect-unmanaged-pods
+        template: detect-unmanaged-pods
+    - - name: migrate-pods
+        template: migrate-pods
+    - - name: verify-cilium-status
+        template: verify-cilium-status
+    - - name: remove-flannel
+        template: remove-flannel
+    - - name: restart-workflow-operator
+        template: restart-workflow-operator
+
+  # Check prerequisites
+  - name: check-prerequisites
+    container:
+      image: bitnami/kubectl:latest
+      command: ["/bin/bash"]
+      args:
+      - -c
+      - |
+        echo "Checking cluster readiness..."
+        kubectl get nodes
+        if [ $? -ne 0 ]; then
+          echo "Cannot connect to cluster"
+          exit 1
+        fi
+        
+        echo "Checking if Cilium is installed..."
+        if ! kubectl get ds -n cilium cilium >/dev/null 2>&1; then
+          echo "Cilium daemonset not found. Please install Cilium first."
+          exit 1
+        fi
+
+  # Wait for Cilium pods
+  - name: wait-for-cilium
+    container:
+      image: bitnami/kubectl:latest
+      command: ["/bin/bash"]
+      args:
+      - -c
+      - |
+        echo "Waiting for Cilium pods to be ready..."
+        kubectl -n cilium wait --for=condition=ready pod -l k8s-app=cilium --timeout=10m
+
+  # Detect unmanaged pods
+  - name: detect-unmanaged-pods
+    container:
+      image: bitnami/kubectl:latest
+      command: ["/bin/bash"]
+      args:
+      - -c
+      - |
+        echo "Creating pods detection script..."
+        cat << 'EOF' > /tmp/k8s-unmanaged.sh
+        #!/bin/bash
+        function all_ceps() {
+          kubectl get cep --all-namespaces -o json | jq -r '.items[].metadata | .namespace + "/" + .name'
+        }
+        function all_pods() {
+          kubectl get pods --all-namespaces -o json | jq -r '.items[] | select((.status.phase=="Running" or .status.phase=="Pending") and (.spec.hostNetwork==true | not)) | .metadata | .namespace + "/" + .name'
+        }
+        echo "Skipping pods with host networking enabled or with status not in Running or Pending phase..."
+        sort <(all_ceps) <(all_pods) | uniq -u
+        EOF
+
+        chmod +x /tmp/k8s-unmanaged.sh
+        
+        echo "Detecting unmanaged pods..."
+        UNMANAGED_PODS=$(/tmp/k8s-unmanaged.sh)
+        echo "$UNMANAGED_PODS" > /tmp/unmanaged-pods.txt
+
+  # Migrate pods
+  - name: migrate-pods
+    container:
+      image: bitnami/kubectl:latest
+      command: ["/bin/bash"]
+      args:
+      - -c
+      - |
+        if [ -f /tmp/unmanaged-pods.txt ] && [ -s /tmp/unmanaged-pods.txt ]; then
+          echo "Found unmanaged pods:"
+          cat /tmp/unmanaged-pods.txt
+          
+          while IFS= read -r line; do
+            if [ ! -z "$line" ]; then
+              NS=$(echo "$line" | cut -d'/' -f1)
+              POD=$(echo "$line" | cut -d'/' -f2)
+              
+              # Skip only workflow controller pods
+              if [[ "$NS" == "argo-workflows" && "$POD" =~ ^(workflow-controller) ]]; then
+                echo "Skipping workflow pod $POD in namespace $NS"
+                continue
+              fi
+              
+              echo "Deleting pod $POD in namespace $NS"
+              kubectl delete pod -n "$NS" "$POD" --wait=false
+            fi
+          done < /tmp/unmanaged-pods.txt
+        else
+          echo "No unmanaged pods found."
+        fi
+        
+        echo "Waiting for pods to stabilize..."
+        sleep 60
+        # kubectl wait --for=condition=ready pod --all -A --timeout=10m || true
+
+  # Verify Cilium status
+  - name: verify-cilium-status
+    container:
+      image: bitnami/kubectl:latest
+      command: ["/bin/bash"]
+      args:
+      - -c
+      - |
+        attempts=0
+        max_attempts=5
+        while [ $attempts -lt $max_attempts ]; do
+          # Get all running pods excluding completed workflow pods
+          TOTAL_PODS=$(kubectl get pods -A --field-selector status.phase=Running,status.phase=Pending | grep -v "Completed" | grep -v "NAME" | wc -l)
+          CILIUM_MANAGED=$(kubectl get cep -A | grep -v "NAME" | wc -l)
+          
+          # Count workflow-related pods that we should exclude
+          WORKFLOW_PODS=$(kubectl get pods -A --field-selector status.phase=Running,status.phase=Pending | grep -E "cilium-flannel-migration|my-argo-workflows|workflow-controller" | wc -l)
+          
+          # Count cilium-related pods that are self-managed
+          CILIUM_PODS=$(kubectl get pods -A --field-selector status.phase=Running,status.phase=Pending | grep -E "cilium-|hubble-|clustermesh-" | wc -l)
+          
+          echo "Total running pods: $TOTAL_PODS"
+          echo "Workflow pods to exclude: $WORKFLOW_PODS"
+          echo "Cilium pods to exclude: $CILIUM_PODS"
+          echo "Cilium managed endpoints: $CILIUM_MANAGED"
+          
+          # Calculate expected managed pods
+          EXPECTED_MANAGED=$((TOTAL_PODS - WORKFLOW_PODS - CILIUM_PODS))
+          
+          echo "Expected pods to be managed: $EXPECTED_MANAGED"
+          
+          if [ "$CILIUM_MANAGED" -ge "$EXPECTED_MANAGED" ]; then
+            echo "All non-workflow pods are now managed by Cilium"
+            exit 0
+          fi
+          
+          attempts=$((attempts + 1))
+          echo "Some pods are not yet managed by Cilium (attempt $attempts of $max_attempts)"
+          echo "Waiting for $EXPECTED_MANAGED pods to be managed, currently managing $CILIUM_MANAGED"
+          sleep 30
+        done
+        
+        echo "Migration verification failed after $max_attempts attempts"
+        exit 1
+
+  # Remove Flannel
+  - name: remove-flannel
+    container:
+      image: bitnami/kubectl:latest
+      command: ["/bin/bash"]
+      args:
+      - -c
+      - |
+        echo "Removing Flannel CNI..."
+        kubectl delete -n kube-system daemonset kube-flannel-ds || true
+        kubectl delete -n kube-system configmap kube-flannel-cfg || true
+      
+
+  # Restart Workflow Operator
+  - name: restart-workflow-operator
+    container:
+      image: bitnami/kubectl:latest
+      command: ["/bin/bash"]
+      args:
+      - -c
+      - |
+        echo "Restarting workflow controller pods..."
+        # Delete workflow operator pods to let them be recreated with Cilium
+        kubectl delete pod -n argo-workflows -l app.kubernetes.io/part-of=argo-workflows --wait=false
