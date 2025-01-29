@@ -4,4 +4,4 @@ cluster:
 ipam:
   mode: "kubernetes"
 clustermesh:
-  useAPIServer: true
+  useAPIServer: false
